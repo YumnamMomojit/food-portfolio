@@ -1,0 +1,526 @@
+#!/bin/bash
+
+# Food Portfolio - Automated Deployment Script with Terraform
+# This script automates the entire deployment process including AWS infrastructure and Docker containers
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+TERRAFORM_DIR="$PROJECT_ROOT/terraform"
+LOG_FILE="$PROJECT_ROOT/deployment.log"
+
+# Default values
+ENVIRONMENT="prod"
+AWS_REGION="us-east-1"
+INSTANCE_TYPE="t3.small"
+DOMAIN_NAME=""
+ENABLE_SSL="false"
+CREATE_ALB="false"
+AUTO_APPROVE="false"
+DESTROY_MODE="false"
+
+# Function to log messages
+log() {
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"
+    exit 1
+}
+
+warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+# Function to display help
+show_help() {
+    cat << EOF
+Food Portfolio - Automated Deployment Script
+
+USAGE:
+    $0 [OPTIONS] COMMAND
+
+COMMANDS:
+    deploy      Deploy the infrastructure and application
+    destroy     Destroy all AWS resources
+    plan        Show Terraform execution plan
+    apply       Apply Terraform changes
+    output      Show Terraform outputs
+    status      Show deployment status
+    ssh         SSH into the EC2 instance
+    logs        Show deployment logs
+    help        Show this help message
+
+OPTIONS:
+    -e, --environment ENV       Environment (dev/staging/prod) [default: prod]
+    -r, --region REGION        AWS region [default: us-east-1]
+    -t, --instance-type TYPE   EC2 instance type [default: t3.small]
+    -d, --domain DOMAIN        Domain name for the application
+    -s, --enable-ssl           Enable SSL with Let's Encrypt
+    -l, --load-balancer        Create Application Load Balancer
+    -y, --auto-approve         Skip interactive approval
+    --destroy                  Destroy mode (use with destroy command)
+
+REQUIRED ENVIRONMENT VARIABLES:
+    AWS_ACCESS_KEY_ID         AWS Access Key ID
+    AWS_SECRET_ACCESS_KEY     AWS Secret Access Key
+    TF_VAR_supabase_url       Supabase project URL
+    TF_VAR_supabase_anon_key  Supabase anonymous key
+    TF_VAR_supabase_service_role_key  Supabase service role key
+    TF_VAR_gemini_api_key     Google Gemini AI API key
+    TF_VAR_public_key_content SSH public key content
+
+EXAMPLES:
+    # Basic deployment
+    $0 deploy
+
+    # Production deployment with custom domain and SSL
+    $0 -e prod -d yourdomain.com -s deploy
+
+    # Development deployment with Load Balancer
+    $0 -e dev -t t3.micro -l deploy
+
+    # Show what will be deployed
+    $0 plan
+
+    # Destroy everything
+    $0 destroy
+
+    # SSH into the deployed instance
+    $0 ssh
+
+EOF
+}
+
+# Function to check prerequisites
+check_prerequisites() {
+    log "Checking prerequisites..."
+    
+    # Check if Terraform is installed
+    if ! command -v terraform &> /dev/null; then
+        error "Terraform is not installed. Please install Terraform first."
+    fi
+    
+    # Check if AWS CLI is installed
+    if ! command -v aws &> /dev/null; then
+        error "AWS CLI is not installed. Please install AWS CLI first."
+    fi
+    
+    # Check if jq is installed
+    if ! command -v jq &> /dev/null; then
+        warning "jq is not installed. Some features may not work properly."
+    fi
+    
+    # Check required environment variables
+    local required_vars=(
+        "AWS_ACCESS_KEY_ID"
+        "AWS_SECRET_ACCESS_KEY"
+        "TF_VAR_supabase_url"
+        "TF_VAR_supabase_anon_key"
+        "TF_VAR_supabase_service_role_key"
+        "TF_VAR_gemini_api_key"
+        "TF_VAR_public_key_content"
+    )
+    
+    local missing_vars=()
+    for var in "${required_vars[@]}"; do
+        if [[ -z "${!var}" ]]; then
+            missing_vars+=("$var")
+        fi
+    done
+    
+    if [[ ${#missing_vars[@]} -gt 0 ]]; then
+        error "Missing required environment variables: ${missing_vars[*]}"
+    fi
+    
+    # Validate Terraform configuration
+    if [[ ! -d "$TERRAFORM_DIR" ]]; then
+        error "Terraform directory not found: $TERRAFORM_DIR"
+    fi
+    
+    success "Prerequisites check completed"
+}
+
+# Function to setup Terraform variables
+setup_terraform_vars() {
+    log "Setting up Terraform variables..."
+    
+    export TF_VAR_environment="$ENVIRONMENT"
+    export TF_VAR_aws_region="$AWS_REGION"
+    export TF_VAR_instance_type="$INSTANCE_TYPE"
+    export TF_VAR_domain_name="$DOMAIN_NAME"
+    export TF_VAR_enable_ssl="$ENABLE_SSL"
+    export TF_VAR_create_load_balancer="$CREATE_ALB"
+    
+    # Create terraform.tfvars file
+    cat > "$TERRAFORM_DIR/terraform.tfvars" << EOF
+# Terraform Variables - Generated by deployment script
+# $(date)
+
+# Project Configuration
+project_name = "food-portfolio"
+environment = "$ENVIRONMENT"
+owner = "DevOps Team"
+
+# AWS Configuration
+aws_region = "$AWS_REGION"
+
+# EC2 Configuration
+instance_type = "$INSTANCE_TYPE"
+volume_size = 20
+volume_type = "gp3"
+
+# Network Configuration
+vpc_cidr = "10.0.0.0/16"
+public_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24"]
+
+# Security Configuration
+allowed_ssh_cidrs = ["0.0.0.0/0"]  # Consider restricting this in production
+allowed_app_cidrs = ["0.0.0.0/0"]
+
+# Application Configuration
+domain_name = "$DOMAIN_NAME"
+enable_ssl = $ENABLE_SSL
+create_load_balancer = $CREATE_ALB
+docker_image_tag = "latest"
+
+# Monitoring Configuration
+enable_monitoring = true
+log_retention_days = 7
+
+# Backup Configuration
+enable_backup = true
+backup_retention_days = 7
+
+# SSL Configuration
+ssl_email = "admin@${DOMAIN_NAME:-example.com}"
+EOF
+
+    info "Terraform variables configured"
+}
+
+# Function to initialize Terraform
+init_terraform() {
+    log "Initializing Terraform..."
+    
+    cd "$TERRAFORM_DIR"
+    
+    # Initialize Terraform
+    terraform init -upgrade
+    
+    # Validate configuration
+    terraform validate
+    
+    success "Terraform initialized successfully"
+}
+
+# Function to create Terraform plan
+create_plan() {
+    log "Creating Terraform execution plan..."
+    
+    cd "$TERRAFORM_DIR"
+    
+    terraform plan -out=tfplan
+    
+    success "Terraform plan created"
+}
+
+# Function to apply Terraform changes
+apply_terraform() {
+    log "Applying Terraform changes..."
+    
+    cd "$TERRAFORM_DIR"
+    
+    if [[ "$AUTO_APPROVE" == "true" ]]; then
+        terraform apply -auto-approve tfplan
+    else
+        terraform apply tfplan
+    fi
+    
+    success "Terraform changes applied successfully"
+}
+
+# Function to destroy infrastructure
+destroy_infrastructure() {
+    warning "This will destroy ALL AWS resources created by this deployment!"
+    
+    if [[ "$DESTROY_MODE" != "true" ]]; then
+        read -p "Are you sure you want to destroy the infrastructure? (yes/no): " confirm
+        if [[ "$confirm" != "yes" ]]; then
+            info "Destruction cancelled"
+            return 0
+        fi
+    fi
+    
+    log "Destroying infrastructure..."
+    
+    cd "$TERRAFORM_DIR"
+    
+    if [[ "$AUTO_APPROVE" == "true" ]]; then
+        terraform destroy -auto-approve
+    else
+        terraform destroy
+    fi
+    
+    success "Infrastructure destroyed"
+}
+
+# Function to show outputs
+show_outputs() {
+    log "Showing Terraform outputs..."
+    
+    cd "$TERRAFORM_DIR"
+    
+    if terraform output > /dev/null 2>&1; then
+        echo -e "\n${CYAN}=== Deployment Information ===${NC}"
+        terraform output -json | jq -r '
+            .application_url.value as $app_url |
+            .api_url.value as $api_url |
+            .health_check_url.value as $health_url |
+            .ssh_connection_command.value as $ssh_cmd |
+            .public_ip.value as $public_ip |
+            "Application URL: " + $app_url,
+            "API URL: " + $api_url,
+            "Health Check: " + $health_url,
+            "Public IP: " + $public_ip,
+            "SSH Command: " + $ssh_cmd
+        '
+        
+        echo -e "\n${CYAN}=== Cost Estimation ===${NC}"
+        terraform output cost_estimation
+        
+        echo -e "\n${CYAN}=== Next Steps ===${NC}"
+        terraform output post_deployment_steps | jq -r '.[]'
+        
+    else
+        warning "No Terraform state found. Run 'deploy' first."
+    fi
+}
+
+# Function to check deployment status
+check_status() {
+    log "Checking deployment status..."
+    
+    cd "$TERRAFORM_DIR"
+    
+    if terraform output public_ip > /dev/null 2>&1; then
+        local public_ip=$(terraform output -raw public_ip)
+        local health_url=$(terraform output -raw health_check_url)
+        
+        echo -e "\n${CYAN}=== Infrastructure Status ===${NC}"
+        aws ec2 describe-instances \
+            --filters "Name=ip-address,Values=$public_ip" \
+            --query 'Reservations[0].Instances[0].[InstanceId,State.Name,InstanceType]' \
+            --output table 2>/dev/null || echo "Could not fetch EC2 status"
+        
+        echo -e "\n${CYAN}=== Application Health ===${NC}"
+        if curl -f -s "$health_url" > /dev/null 2>&1; then
+            success "✓ Application is healthy"
+        else
+            warning "✗ Application health check failed"
+            info "Trying direct IP access..."
+            if curl -f -s "http://$public_ip:5000/api/health" > /dev/null 2>&1; then
+                success "✓ Application accessible via direct IP"
+            else
+                error "✗ Application not accessible"
+            fi
+        fi
+        
+        echo -e "\n${CYAN}=== Recent Activity ===${NC}"
+        info "Application might take 3-5 minutes to fully initialize after deployment"
+        
+    else
+        warning "No deployment found. Run 'deploy' first."
+    fi
+}
+
+# Function to SSH into instance
+ssh_to_instance() {
+    cd "$TERRAFORM_DIR"
+    
+    if terraform output ssh_connection_command > /dev/null 2>&1; then
+        local ssh_command=$(terraform output -raw ssh_connection_command)
+        info "Connecting to EC2 instance..."
+        info "SSH Command: $ssh_command"
+        
+        # Extract the key name and IP from the command
+        local public_ip=$(terraform output -raw public_ip)
+        local key_name=$(terraform output -raw key_pair_name)
+        
+        # Try to SSH (user needs to have the private key)
+        echo -e "\n${YELLOW}Note: Make sure you have the private key file: ~/.ssh/${key_name}.pem${NC}"
+        echo -e "${YELLOW}If the key doesn't exist, you'll need to create it from the key pair in AWS Console${NC}\n"
+        
+        # Just show the command for now
+        echo "Run this command to SSH:"
+        echo "$ssh_command"
+        
+    else
+        error "No deployment found. Run 'deploy' first."
+    fi
+}
+
+# Function to show logs
+show_logs() {
+    info "Deployment logs:"
+    if [[ -f "$LOG_FILE" ]]; then
+        tail -n 50 "$LOG_FILE"
+    else
+        warning "No log file found"
+    fi
+    
+    # Also try to show Terraform logs if available
+    cd "$TERRAFORM_DIR"
+    if [[ -f "terraform.log" ]]; then
+        echo -e "\n${CYAN}=== Terraform Logs ===${NC}"
+        tail -n 20 terraform.log
+    fi
+}
+
+# Function to perform full deployment
+deploy_full() {
+    log "Starting full deployment of Food Portfolio..."
+    
+    # Step 1: Check prerequisites
+    check_prerequisites
+    
+    # Step 2: Setup variables
+    setup_terraform_vars
+    
+    # Step 3: Initialize Terraform
+    init_terraform
+    
+    # Step 4: Create plan
+    create_plan
+    
+    # Step 5: Show plan summary
+    info "Deployment plan created. Review the changes above."
+    if [[ "$AUTO_APPROVE" != "true" ]]; then
+        read -p "Do you want to proceed with the deployment? (yes/no): " confirm
+        if [[ "$confirm" != "yes" ]]; then
+            info "Deployment cancelled"
+            return 0
+        fi
+    fi
+    
+    # Step 6: Apply changes
+    apply_terraform
+    
+    # Step 7: Show outputs
+    show_outputs
+    
+    # Step 8: Verify deployment
+    info "Waiting 30 seconds before checking application health..."
+    sleep 30
+    check_status
+    
+    success "Deployment completed successfully!"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -e|--environment)
+            ENVIRONMENT="$2"
+            shift 2
+            ;;
+        -r|--region)
+            AWS_REGION="$2"
+            shift 2
+            ;;
+        -t|--instance-type)
+            INSTANCE_TYPE="$2"
+            shift 2
+            ;;
+        -d|--domain)
+            DOMAIN_NAME="$2"
+            shift 2
+            ;;
+        -s|--enable-ssl)
+            ENABLE_SSL="true"
+            shift
+            ;;
+        -l|--load-balancer)
+            CREATE_ALB="true"
+            shift
+            ;;
+        -y|--auto-approve)
+            AUTO_APPROVE="true"
+            shift
+            ;;
+        --destroy)
+            DESTROY_MODE="true"
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Main command processing
+case "${1:-deploy}" in
+    deploy)
+        deploy_full
+        ;;
+    destroy)
+        check_prerequisites
+        setup_terraform_vars
+        init_terraform
+        destroy_infrastructure
+        ;;
+    plan)
+        check_prerequisites
+        setup_terraform_vars
+        init_terraform
+        create_plan
+        ;;
+    apply)
+        check_prerequisites
+        setup_terraform_vars
+        init_terraform
+        apply_terraform
+        show_outputs
+        ;;
+    output)
+        show_outputs
+        ;;
+    status)
+        check_status
+        ;;
+    ssh)
+        ssh_to_instance
+        ;;
+    logs)
+        show_logs
+        ;;
+    help)
+        show_help
+        ;;
+    *)
+        error "Unknown command: $1. Use '$0 help' for usage information."
+        ;;
+esac
